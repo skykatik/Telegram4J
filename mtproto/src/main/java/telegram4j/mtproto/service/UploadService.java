@@ -15,6 +15,7 @@
  */
 package telegram4j.mtproto.service;
 
+import io.netty.buffer.Unpooled;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
@@ -22,6 +23,7 @@ import reactor.function.TupleUtils;
 import reactor.util.Logger;
 import reactor.util.Loggers;
 import telegram4j.mtproto.DcId;
+import telegram4j.mtproto.RpcException;
 import telegram4j.mtproto.client.MTProtoClient;
 import telegram4j.mtproto.client.MTProtoClientGroup;
 import telegram4j.mtproto.file.FileReferenceId;
@@ -39,6 +41,8 @@ import telegram4j.tl.request.upload.ImmutableGetFileHashes;
 import telegram4j.tl.request.upload.ImmutableGetWebFile;
 import telegram4j.tl.storage.FileType;
 import telegram4j.tl.upload.BaseFile;
+import telegram4j.tl.upload.ImmutableBaseFile;
+import telegram4j.tl.upload.ImmutableWebFile;
 import telegram4j.tl.upload.WebFile;
 
 import java.time.Duration;
@@ -59,6 +63,7 @@ public class UploadService extends RpcService {
     static final int MAX_PARTS_COUNT = 4000; // it's for users with tg premium; for other users limit is 3000
     static final long MAX_FILE_SIZE = 4L * 1000 * 1024 * 1024; // 4gb for premium users; for other = 2gb
     static final int MAX_INFLIGHT_REQUESTS = 3; // optimal count of pending upload.getFile requests
+    static final String OFFSET_INVALID_MESSAGE = "OFFSET_INVALID";
 
     public UploadService(MTProtoClientGroup groupManager, StoreLayout storeLayout) {
         super(groupManager, storeLayout);
@@ -108,6 +113,12 @@ public class UploadService extends RpcService {
                 .flatMapSequential(i -> {
                     var requiredDelay = Mono.delay(Duration.ofMillis(20), Schedulers.single());
                     return client.send(request.withOffset(offset.getAndAdd(limit)))
+                            .onErrorReturn(UploadService::isOffsetInvalid,
+                                    ImmutableBaseFile.builder()
+                                            .bytes(Unpooled.EMPTY_BUFFER)
+                                            .mtime(0)
+                                            .type(FileType.UNKNOWN)
+                                            .build())
                             .flatMap(requiredDelay::thenReturn);
                 })
                 .repeat(() -> !complete.get())
@@ -121,6 +132,10 @@ public class UploadService extends RpcService {
                 });
     }
 
+    private static boolean isOffsetInvalid(Throwable tx) {
+        return tx instanceof RpcException && OFFSET_INVALID_MESSAGE.equals(((RpcException) tx).getError().errorMessage());
+    }
+
     @Compatible(Type.BOTH)
     public Flux<BaseFile> getFile(FileReferenceId location,
                                   long offset, int limit, boolean precise) {
@@ -128,18 +143,18 @@ public class UploadService extends RpcService {
         if (limit <= 0) return Flux.error(new IllegalArgumentException("limit is not positive"));
 
         if (!precise) {
-            if (offset % (4*1024) != 0)
+            if (offset % (4 * 1024) != 0)
                 return Flux.error(new IllegalArgumentException("offset must be divisible by 4KB"));
-            if (limit % (4*1024) != 0)
+            if (limit % (4 * 1024) != 0)
                 return Flux.error(new IllegalArgumentException("limit must be divisible by 4KB"));
-            if ((1024*1024) % limit != 0)
+            if ((1024 * 1024) % limit != 0)
                 return Flux.error(new IllegalArgumentException("1MB must be divisible by limit"));
         } else {
             if (offset % 1024 != 0)
                 return Flux.error(new IllegalArgumentException("offset must be divisible by 1KB"));
             if (limit % 1024 != 0)
                 return Flux.error(new IllegalArgumentException("limit must be divisible by 1KB"));
-            if (limit > 1024*1024)
+            if (limit > 1024 * 1024)
                 return Flux.error(new IllegalArgumentException("limit must not exceed 1MB"));
         }
 
@@ -168,7 +183,13 @@ public class UploadService extends RpcService {
             ImmutableGetWebFile request = ImmutableGetWebFile.of(location, baseOffset, limit);
 
             return Flux.range(0, MAX_INFLIGHT_REQUESTS)
-                    .flatMapSequential(i -> client.send(request.withOffset(offset.getAndAdd(limit))))
+                    .flatMapSequential(i -> client.send(request.withOffset(offset.getAndAdd(limit)))
+                            .onErrorReturn(UploadService::isOffsetInvalid,
+                                    ImmutableWebFile.builder()
+                                            .bytes(Unpooled.EMPTY_BUFFER)
+                                            .mtime(0)
+                                            .fileType(FileType.UNKNOWN)
+                                            .build()))
                     .repeat(() -> !complete.get())
                     .mapNotNull(part -> {
                         offset.addAndGet(limit);
@@ -194,7 +215,7 @@ public class UploadService extends RpcService {
                             .zipWith(clientGroup.getOrCreateClient(dc));
                 })
                 .flatMap(TupleUtils.function((auth, client) -> client.send(
-                        ImmutableImportAuthorization.of(auth.id(), auth.bytes()))
+                                ImmutableImportAuthorization.of(auth.id(), auth.bytes()))
                         .thenReturn(client)))
                 .flatMapMany(client -> getWebFile0(client, location, offset, limit));
     }
